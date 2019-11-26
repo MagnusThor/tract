@@ -6,7 +6,6 @@ use crate::ops::cnn::conv::KernelFormat;
 use crate::ops::cnn::PaddingSpec;
 use crate::ops::nn::DataFormat;
 use crate::ops::quant::QParams;
-use std::borrow::Borrow;
 
 #[derive(Debug, Clone, Default)]
 pub struct Conv {
@@ -101,9 +100,14 @@ impl Conv {
         result
     }
 
-    pub fn to_unary(&self, inputs: &[impl Borrow<TypedFact>]) -> TractResult<Option<ConvUnary>> {
-        let input = &inputs[0].borrow();
-        let kernel = &inputs[self.k_input.unwrap_or(1)].borrow();
+    pub fn wire_as_unary(
+        &self,
+        name: &str,
+        inputs: &[OutletId],
+        model: &mut TypedModel,
+    ) -> TractResult<Option<OutletId>> {
+        let input = model.outlet_fact(inputs[0])?;
+        let kernel = model.outlet_fact(inputs[self.k_input.unwrap_or(1)])?;
         let input_shape = self.data_format.shape(input.shape.iter().collect::<TVec<_>>());
         let kshape = kernel.shape.iter().collect::<TVec<_>>();
         let channels_in = match self.kernel_fmt {
@@ -115,46 +119,50 @@ impl Conv {
         }
         if let Some(kvalue) = kernel.konst.clone() {
             let mut qp = None;
-            let dt = self.override_output_datum_type.unwrap_or(input.datum_type);
-            let mut scale = 1.0;
+            // let dt = self.override_output_datum_type.unwrap_or(input.datum_type);
+            let dt = i32::datum_type();
+            let mut input_scale = 1.0;
             if let Some(slot) = self.x_scale_input {
-                if let Some(ref value) = inputs[slot].borrow().konst {
-                    scale *= value.to_scalar::<f32>()?;
+                if let Some(ref value) = model.outlet_fact(inputs[slot])?.konst {
+                    input_scale *= value.to_scalar::<f32>()?;
                 } else {
                     bail!("Input scale must be const")
                 }
             }
             if let Some(slot) = self.k_scale_input {
-                if let Some(ref value) = inputs[slot].borrow().konst {
-                    scale *= value.to_scalar::<f32>()?;
+                if let Some(ref value) = model.outlet_fact(inputs[slot])?.konst {
+                    input_scale *= value.to_scalar::<f32>()?;
                 } else {
                     bail!("Filter scale must be const")
                 }
             }
+            /*
             if let Some(slot) = self.y_scale_input {
                 if let Some(ref value) = inputs[slot].borrow().konst {
-                    scale /= value.to_scalar::<f32>()?;
+                    input_scale /= value.to_scalar::<f32>()?;
                 } else {
                     bail!("Output scale must be const")
                 }
             }
-            if scale != 1.0 {
-                qp.get_or_insert(QParams::new(dt)).set_scale_factor(scale);
+            */
+            if input_scale != 1.0 {
+                qp.get_or_insert(QParams::new(dt)).set_scale_factor(input_scale);
             }
             if let Some(slot) = self.x_zero_point_input {
-                if let Some(ref value) = inputs[slot].borrow().konst {
+                if let Some(ref value) = model.outlet_fact(inputs[slot])?.konst {
                     qp.get_or_insert(QParams::new(dt)).set_zero_point_b(value);
                 } else {
                     bail!("Input zero point must be const")
                 }
             }
             if let Some(slot) = self.k_zero_point_input {
-                if let Some(ref value) = inputs[slot].borrow().konst {
+                if let Some(ref value) = model.outlet_fact(inputs[slot])?.konst {
                     qp.get_or_insert(QParams::new(dt)).set_zero_point_a(value);
                 } else {
                     bail!("Kernel zero point must be const")
                 }
             }
+            /*
             if let Some(slot) = self.y_zero_point_input {
                 if let Some(ref value) = inputs[slot].borrow().konst {
                     qp.get_or_insert(QParams::new(dt)).set_zero_point_c(value);
@@ -171,8 +179,10 @@ impl Conv {
             } else {
                 None
             };
-            let reduced = ConvUnary::new(&self, kvalue, self.group.unwrap_or(1), bias, qp)?;
-            return Ok(Some(reduced));
+            */
+            let reduced = ConvUnary::new(&self, kvalue, self.group.unwrap_or(1), None, qp)?;
+            let output = model.wire_node(name, reduced, &inputs[0..=0])?;
+            return Ok(Some(output[0]));
         }
         Ok(None)
     }
@@ -193,9 +203,16 @@ impl Op for Conv {
 
 impl StatelessOp for Conv {
     fn eval(&self, inputs: TVec<Arc<Tensor>>) -> TractResult<TVec<Arc<Tensor>>> {
-        let inputs_info: TVec<TypedFact> = inputs.iter().map(|t| TypedFact::from(&**t)).collect();
-        let unary = self.to_unary(&*inputs_info)?.unwrap();
-        unary.eval(tvec!(inputs[0].clone()))
+        let mut model = TypedModel::default();
+        let wires: Vec<_> = inputs
+            .iter()
+            .enumerate()
+            .map(|(ix, t)| model.add_source(format!("ad-hoc-{}", ix), t.clone().into_tensor().into()))
+            .collect::<TractResult<_>>()?;
+        let wire = self.wire_as_unary("ad-hoc", &*wires, &mut model)?.unwrap();
+        model.set_output_outlets(&[wire])?;
+        let plan = SimplePlan::new(model)?;
+        plan.run(inputs.into_iter().map(|t| t.into_tensor()).collect())
     }
 }
 
@@ -265,9 +282,12 @@ impl InferenceRulesOp for Conv {
 
 impl TypedOp for Conv {
     fn output_facts(&self, inputs: &[&TypedFact]) -> TractResult<TVec<TypedFact>> {
-        if inputs[1].shape.iter().all(|d| d.to_integer().is_ok()) {
-            let kshape: TVec<usize> =
-                inputs[1].shape.iter().map(|d| d.to_integer().unwrap() as _).collect();
+        if let Ok(kshape) = inputs[self.k_input.unwrap_or(1)]
+            .shape
+            .iter()
+            .map(|d| d.to_integer().map(|x| x as usize))
+            .collect::<TractResult<TVec<_>>>()
+        {
             let oshape = self.output_shape(&*inputs[0].shape.to_tvec(), &*kshape);
             Ok(tvec!(TypedFact::dt_shape(inputs[0].datum_type, &*oshape)?))
         } else {
@@ -275,25 +295,24 @@ impl TypedOp for Conv {
         }
     }
 
-    fn cost(&self, inputs: &[&TypedFact]) -> TractResult<TVec<(Cost, TDim)>> {
-        let unary =
-            self.to_unary(&*inputs)?.ok_or_else(|| format!("Can not unarize conv: {:?}", self))?;
-        unary.cost(&[inputs[0]])
-    }
-
     fn declutter(
         &self,
         model: &TypedModel,
         node: &TypedNode,
     ) -> TractResult<Option<TypedModelPatch>> {
-        let inputs = model.node_input_facts(node.id)?;
-        if let Some(op) = self.to_unary(&*inputs)? {
-            return Ok(Some(TypedModelPatch::single_unary_op(model, node, op)?));
+        let mut patch = TypedModelPatch::default();
+        let inputs = node
+            .inputs
+            .iter()
+            .map(|i| patch.tap_model(model, *i))
+            .collect::<TractResult<Vec<_>>>()?;
+        if let Some(wire) = self.wire_as_unary(&*node.name, &inputs, &mut patch)? {
+            patch.shunt_outside(OutletId::new(node.id, 0), wire)?;
+            Ok(Some(patch))
         } else {
             Ok(None)
         }
     }
-
 
     typed_op_as_op!();
 }

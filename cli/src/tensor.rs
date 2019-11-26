@@ -23,7 +23,7 @@ pub fn parse_spec(size: &str) -> CliResult<InferenceFact> {
             "i32" => DatumType::I32,
             "i8" => DatumType::I8,
             "u8" => DatumType::U8,
-            _ => bail!("Type of the input should be f64, f32, i32, i8 or u8."),
+            _ => bail!("Parsing {} as inline input spec, type of the input should be f64, f32, i32, i8 or u8.", size),
         };
         (Some(datum_type), &splits[0..splits.len() - 1])
     };
