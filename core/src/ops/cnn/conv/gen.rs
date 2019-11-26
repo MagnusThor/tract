@@ -5,7 +5,7 @@ use crate::dim::DimLike;
 use crate::ops::cnn::conv::KernelFormat;
 use crate::ops::cnn::PaddingSpec;
 use crate::ops::nn::DataFormat;
-use crate::ops::quant::QParams;
+use crate::ops::quant;
 
 #[derive(Debug, Clone, Default)]
 pub struct Conv {
@@ -136,42 +136,25 @@ impl Conv {
                     bail!("Filter scale must be const")
                 }
             }
-            /*
-            if let Some(slot) = self.y_scale_input {
-                if let Some(ref value) = inputs[slot].borrow().konst {
-                    input_scale /= value.to_scalar::<f32>()?;
-                } else {
-                    bail!("Output scale must be const")
-                }
-            }
-            */
             if input_scale != 1.0 {
-                qp.get_or_insert(QParams::new(dt)).set_scale_factor(input_scale);
+                qp.get_or_insert(quant::QParams::new(dt)).set_scale_factor(input_scale);
             }
             if let Some(slot) = self.x_zero_point_input {
                 if let Some(ref value) = model.outlet_fact(inputs[slot])?.konst {
-                    qp.get_or_insert(QParams::new(dt)).set_zero_point_b(value);
+                    qp.get_or_insert(quant::QParams::new(dt)).set_zero_point_b(value);
                 } else {
                     bail!("Input zero point must be const")
                 }
             }
             if let Some(slot) = self.k_zero_point_input {
                 if let Some(ref value) = model.outlet_fact(inputs[slot])?.konst {
-                    qp.get_or_insert(QParams::new(dt)).set_zero_point_a(value);
+                    qp.get_or_insert(quant::QParams::new(dt)).set_zero_point_a(value);
                 } else {
                     bail!("Kernel zero point must be const")
                 }
             }
-            /*
-            if let Some(slot) = self.y_zero_point_input {
-                if let Some(ref value) = inputs[slot].borrow().konst {
-                    qp.get_or_insert(QParams::new(dt)).set_zero_point_c(value);
-                } else {
-                    bail!("Output zero point must be const")
-                }
-            }
             let bias = if let Some(slot) = self.bias_input {
-                if let Some(ref value) = inputs[slot].borrow().konst {
+                if let Some(ref value) = model.outlet_fact(inputs[slot])?.konst {
                     Some(value.clone())
                 } else {
                     bail!("Bias must be const")
@@ -179,10 +162,35 @@ impl Conv {
             } else {
                 None
             };
-            */
-            let reduced = ConvUnary::new(&self, kvalue, self.group.unwrap_or(1), None, qp)?;
-            let output = model.wire_node(name, reduced, &inputs[0..=0])?;
-            return Ok(Some(output[0]));
+            let reduced = ConvUnary::new(&self, kvalue, self.group.unwrap_or(1), bias, qp)?;
+            let mut wire = model.wire_node(name, reduced, &inputs[0..=0])?;
+            if self.y_zero_point_input.is_some() || self.y_scale_input.is_some() {
+                let zp = if let Some(slot) = self.y_zero_point_input {
+                    if let Some(ref value) = model.outlet_fact(inputs[slot])?.konst {
+                        value.clone()
+                    } else {
+                        bail!("Output zero point must be const")
+                    }
+                } else {
+                    rctensor0(0u8)
+                };
+                let scale = if let Some(slot) = self.y_scale_input {
+                    if let Some(ref value) = model.outlet_fact(inputs[slot])?.konst {
+                        *value.to_scalar::<f32>()?
+                    } else {
+                        bail!("Output scale must be const")
+                    }
+                } else {
+                    1.0f32
+                };
+                let op = if zp.datum_type() == u8::datum_type() {
+                    quant::quantize_linear_u8(scale, zp.cast_to_scalar::<u8>()?)
+                } else {
+                    quant::quantize_linear_i8(scale, zp.cast_to_scalar::<i8>()?)
+                };
+                wire = model.wire_node(format!("{}-q", name), op, &wire)?;
+            }
+            return Ok(Some(wire[0]));
         }
         Ok(None)
     }
@@ -207,7 +215,9 @@ impl StatelessOp for Conv {
         let wires: Vec<_> = inputs
             .iter()
             .enumerate()
-            .map(|(ix, t)| model.add_source(format!("ad-hoc-{}", ix), t.clone().into_tensor().into()))
+            .map(|(ix, t)| {
+                model.add_source(format!("ad-hoc-{}", ix), t.clone().into_tensor().into())
+            })
             .collect::<TractResult<_>>()?;
         let wire = self.wire_as_unary("ad-hoc", &*wires, &mut model)?.unwrap();
         model.set_output_outlets(&[wire])?;

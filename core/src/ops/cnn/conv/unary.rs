@@ -336,7 +336,11 @@ impl StatelessOp for ConvUnary {
 
 impl TypedOp for ConvUnary {
     fn output_facts(&self, inputs: &[&TypedFact]) -> TractResult<TVec<TypedFact>> {
-        self.pool_spec.output_facts(inputs)
+        let mut fact = self.pool_spec.output_facts(inputs)?[0].clone();
+        if let Some(qp) = &self.q_params {
+            fact.datum_type = qp.c_datum_type;
+        }
+        Ok(tvec!(fact))
     }
 
     fn axes_info(&self, model: &TypedModel, node: &TypedNode) -> TractResult<AxesInfo> {

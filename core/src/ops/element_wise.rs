@@ -10,6 +10,9 @@ pub trait ElementWiseMiniOp: fmt::Debug + objekt::Clone + Send + Sync + 'static 
     fn validation(&self) -> Validation {
         Validation::Accurate
     }
+    fn info(&self) -> TractResult<Vec<String>> {
+        Ok(vec!())
+    }
     #[allow(unused_variables)]
     fn output_type(&self, input_type: DatumType) -> Option<DatumType> {
         None
@@ -41,6 +44,10 @@ impl Op for ElementWiseOp {
 
     fn validation(&self) -> Validation {
         self.0.validation()
+    }
+
+    fn info(&self) -> TractResult<Vec<String>> {
+        self.0.info()
     }
 
     canonic!();
@@ -188,6 +195,7 @@ macro_rules! element_wise_oop {
     ($func:ident, $Op:ident $({$($var: ident : $var_typ: path),*})?,
         $( [$($typ:ident),*] => $typ_dst:ident $f:expr ),*
         $(; cost: $cost:expr )?
+        $(; info: $info:expr )?
         $(; prefix: $prefix:expr )?
         $(; validation: $validation:expr )?
     ) => {
@@ -221,6 +229,11 @@ macro_rules! element_wise_oop {
             $(
             fn cost_per_element(&self, dt: DatumType) -> TVec<(Cost, usize)> {
                 $cost(dt)
+            }
+            )?
+            $(
+            fn info(&self) -> TractResult<Vec<String>> {
+                $info(&self)
             }
             )?
             $(
